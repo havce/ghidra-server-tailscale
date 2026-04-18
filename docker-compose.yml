@@ -1,0 +1,35 @@
+services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    restart: unless-stopped
+    environment:
+      - TS_EXTRA_ARGS=--advertise-tags=tag:docker
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_SOCKET=/var/run/tailscale/tailscaled.sock
+      - TS_USERSPACE=false
+    cap_add:
+      - net_admin
+      - sys_module
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - tailscale-data:/var/lib
+      - tailscale-run:/var/run/tailscale
+
+  server:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - tailscale
+    network_mode: "service:tailscale"
+    environment:
+      - GHIDRA_PUBLIC_HOSTNAME=ghidra.pigeon-monitor.ts.net
+    # ports:
+    #   - "13100-13102:13100-13102"
+    volumes:
+      - ./repos:/var/lib/ghidra/repositories
+      - tailscale-run:/var/run/tailscale
+
+volumes:
+  tailscale-data:
+  tailscale-run:

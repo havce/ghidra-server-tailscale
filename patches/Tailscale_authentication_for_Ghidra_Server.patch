@@ -1,0 +1,406 @@
+Subject: [PATCH] Tailscale authentication for Ghidra Server
+---
+Index: Ghidra/Features/GhidraServer/src/main/java/ghidra/server/RepositoryManager.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/Ghidra/Features/GhidraServer/src/main/java/ghidra/server/RepositoryManager.java b/Ghidra/Features/GhidraServer/src/main/java/ghidra/server/RepositoryManager.java
+--- a/Ghidra/Features/GhidraServer/src/main/java/ghidra/server/RepositoryManager.java	(revision 64ece4deb7b07b11d750b126160f5d1bbf494e00)
++++ b/Ghidra/Features/GhidraServer/src/main/java/ghidra/server/RepositoryManager.java	(date 1776516864495)
+@@ -17,6 +17,7 @@
+ 
+ import java.io.File;
+ import java.io.IOException;
++import java.net.InetAddress;
+ import java.net.UnknownHostException;
+ import java.rmi.server.RemoteServer;
+ import java.rmi.server.ServerNotActiveException;
+@@ -399,6 +400,29 @@
+ 		return list.toArray(names);
+ 	}
+ 
++	/**
++	 * Returns the raw {@link InetAddress} of the current RMI client (without reverse
++	 * DNS resolution). Must be invoked from within the RMI dispatch thread.
++	 *
++	 * @return the client address, or null if it can't be determined
++	 */
++	public static InetAddress getRMIClientAddress() {
++		Thread currentThread = Thread.currentThread();
++		if (!currentThread.getName().startsWith("RMI TCP Connection")) {
++			return null;
++		}
++		try {
++			String host = RemoteServer.getClientHost();
++			if (host == null) {
++				return null;
++			}
++			return InetAddress.getByName(host);
++		}
++		catch (ServerNotActiveException | UnknownHostException e) {
++			return null;
++		}
++	}
++
+ 	public static String getRMIClient() {
+ 		Thread currentThread = Thread.currentThread();
+ 		if (!currentThread.getName().startsWith("RMI TCP Connection")) {
+Index: Ghidra/Features/GhidraServer/src/main/java/ghidra/server/remote/GhidraServer.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/Ghidra/Features/GhidraServer/src/main/java/ghidra/server/remote/GhidraServer.java b/Ghidra/Features/GhidraServer/src/main/java/ghidra/server/remote/GhidraServer.java
+--- a/Ghidra/Features/GhidraServer/src/main/java/ghidra/server/remote/GhidraServer.java	(revision 64ece4deb7b07b11d750b126160f5d1bbf494e00)
++++ b/Ghidra/Features/GhidraServer/src/main/java/ghidra/server/remote/GhidraServer.java	(date 1776518930901)
+@@ -81,7 +81,7 @@
+ 
+ 	private static String HELP_FILE = "ServerHelp.txt";
+ 	private static String USAGE_ARGS =
+-		"[-ip <hostname>] [-i #.#.#.#] [-p#] [-n] [-a#] [-d<ad_domain>] [-e<days>] [-jaas <config_file>] [-u] [-autoProvision] [-anonymous] [-ssh] <repository_path>";
++		"[-ip <hostname>] [-i #.#.#.#] [-p#] [-n] [-a#] [-d<ad_domain>] [-e<days>] [-jaas <config_file>] [-u] [-autoProvision] [-anonymous] [-ssh] [-tailscale] <repository_path>";
+ 
+ 	private static final String RMI_SERVER_PROPERTY = "java.rmi.server.hostname";
+ 
+@@ -124,6 +124,7 @@
+ 	private AnonymousAuthenticationModule anonymousAuthModule;
+ 	private BlockStreamServer blockStreamServer;
+ 	private boolean autoProvisionAuthedUsers;
++	private boolean tailscaleAuthEnabled;
+ 
+ 	/**
+ 	 * Server handle constructor.
+@@ -148,12 +149,14 @@
+ 	GhidraServer(File rootDir, AuthMode authMode, String loginDomain,
+ 			boolean allowUserToSpecifyName, boolean altSSHLoginAllowed,
+ 			int defaultPasswordExpirationDays, boolean allowAnonymousAccess,
+-			boolean autoProvisionAuthedUsers, File jaasConfigFile)
++			boolean autoProvisionAuthedUsers, File jaasConfigFile,
++			boolean tailscaleAuthEnabled)
+ 			throws IOException, CertificateException {
+ 
+ 		super(ServerPortFactory.getRMISSLPort(), clientSocketFactory, serverSocketFactory);
+ 
+ 		this.autoProvisionAuthedUsers = autoProvisionAuthedUsers;
++		this.tailscaleAuthEnabled = tailscaleAuthEnabled;
+ 
+ 		if (log == null) {
+ 			// logger generally initialized by main method, however during
+@@ -231,6 +234,10 @@
+ 	public Callback[] getAuthenticationCallbacks() throws RemoteException {
+ 		log.info("Authentication callbacks requested by " + RepositoryManager.getRMIClient());
+ 		try {
++			if (resolveTailscaleUser() != null) {
++				// Identity comes from Tailscale; no client-supplied callbacks needed.
++				return null;
++			}
+ 			Callback[] callbacks =
+ 				authModule != null ? authModule.getAuthenticationCallbacks() : null;
+ 			if (sshAuthModule != null) {
+@@ -248,6 +255,13 @@
+ 		}
+ 	}
+ 
++	private String resolveTailscaleUser() {
++		if (!tailscaleAuthEnabled) {
++			return null;
++		}
++		return TailscaleIdentityResolver.resolve(RepositoryManager.getRMIClientAddress());
++	}
++
+ 	@Override
+ 	public void checkCompatibility(int minServerInterfaceVersion) throws RemoteException {
+ 		if (minServerInterfaceVersion > INTERFACE_VERSION) {
+@@ -274,6 +288,37 @@
+ 
+ 		boolean anonymousAccess = false;
+ 		String username = principal.getName();
++		String tailscaleUser = resolveTailscaleUser();
++		if (tailscaleUser != null) {
++			username = tailscaleUser;
++			if (!mgr.getUserManager().isValidUser(username)) {
++				if (autoProvisionAuthedUsers) {
++					try {
++						mgr.getUserManager().addUser(username);
++						RepositoryManager.log(null, null,
++							"User '" + username + "' successful auto provision (tailscale)",
++							username);
++					}
++					catch (DuplicateNameException | IOException e) {
++						RepositoryManager.log(null, null,
++							"User '" + username + "' auto provision failed.  Cause: " +
++								e.getMessage(),
++							username);
++						throw new LoginException(
++							"Error when trying to auto provision tailscale user: " + username);
++					}
++				}
++				else {
++					RepositoryManager.log(null, null,
++						"Tailscale login rejected: unknown user '" + username + "'", null);
++					throw new LoginException("Unknown user: " + username);
++				}
++			}
++			RepositoryManager.log(null, null,
++				"User '" + username + "' authenticated via tailscale",
++				principal.getName());
++			return new RepositoryServerHandleImpl(username, false, mgr, false);
++		}
+ 		if (anonymousAuthModule != null &&
+ 			anonymousAuthModule.anonymousAccessRequested(authCallbacks)) {
+ 			username = UserManager.ANONYMOUS_USERNAME;
+@@ -539,6 +584,7 @@
+ 		int defaultPasswordExpiration = -1;
+ 		boolean autoProvision = false;
+ 		File jaasConfigFile = null;
++		boolean tailscaleAuthEnabled = false;
+ 
+ 		// Network name resolution disabled by default
+ 		InetNameLookup.setLookupEnabled(false);
+@@ -680,6 +726,9 @@
+ 			else if (s.equals("-autoProvision")) {
+ 				autoProvision = true;
+ 			}
++			else if (s.equals("-tailscale")) {
++				tailscaleAuthEnabled = true;
++			}
+ 			else {
+ 				if (i < (args.length - 1)) {
+ 					displayUsage("Invalid usage!");
+@@ -829,6 +878,8 @@
+ 			}
+ 			log.info(
+ 				"   Anonymous server access: " + (allowAnonymousAccess ? "enabled" : "disabled"));
++			log.info(
++				"   Tailscale authentication: " + (tailscaleAuthEnabled ? "enabled" : "disabled"));
+ 
+ 			String enabledCiphers = System.getProperty(TLS_ENABLED_CIPHERS_PROPERTY);
+ 			if (enabledCiphers != null) {
+@@ -854,7 +905,7 @@
+ 
+ 			GhidraServer svr = new GhidraServer(serverRoot, authMode, loginDomain,
+ 				nameCallbackAllowed, altSSHLoginAllowed, defaultPasswordExpiration,
+-				allowAnonymousAccess, autoProvision, jaasConfigFile);
++				allowAnonymousAccess, autoProvision, jaasConfigFile, tailscaleAuthEnabled);
+ 
+ 			log.info("Registering Ghidra Server...");
+ 
+Index: Ghidra/Features/GhidraServer/src/main/java/ghidra/server/remote/ServerHelp.txt
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/Ghidra/Features/GhidraServer/src/main/java/ghidra/server/remote/ServerHelp.txt b/Ghidra/Features/GhidraServer/src/main/java/ghidra/server/remote/ServerHelp.txt
+--- a/Ghidra/Features/GhidraServer/src/main/java/ghidra/server/remote/ServerHelp.txt	(revision 64ece4deb7b07b11d750b126160f5d1bbf494e00)
++++ b/Ghidra/Features/GhidraServer/src/main/java/ghidra/server/remote/ServerHelp.txt	(date 1776519018450)
+@@ -2,6 +2,7 @@
+ Command line parameters:
+ 						[-ip <hostname>] [-i #.#.#.#] [-p#] [-n]
+ 						[-a#] [-d<ad_domain>] [-e<days>] [-jaas <config_file>] [-u] [-autoProvision] [-anonymous] [-ssh]
++						[-tailscale]
+ 						<repository_path>
+ 						
+  
+@@ -42,6 +43,17 @@
+  
+    -ssh : enables SSH authentication for headless clients
+ 
++   -tailscale : enable Tailscale-based authentication. For each incoming connection the
++                server shells out to "tailscale whois --json <client-ip>"; if that call
++                returns a Tailscale user the client is logged in as that user with no
++                credential prompt (the GitHub handle is used as the Ghidra username, e.g.
++                Tailscale LoginName "alice@github" -> "alice"; other providers use the
++                local part of the LoginName). If the CLI call fails (non-Tailscale client,
++                daemon not running, etc.) the connection falls through to the regular
++                -a# authentication flow. Users must already exist in the server, or
++                -autoProvision must be set. The "tailscale" executable must be on PATH,
++                or its path may be overridden via -Dghidra.server.tailscale.cli=<path>.
++
+    <repository_path> : Required.  Directory used to store repositories. This directory must be dedicated to this 
+                        Ghidra Server instance and may not contain files or folders not produced
+                        by the Ghidra Server or its administrative scripts.
+Index: Ghidra/Features/GhidraServer/src/test.slow/java/ghidra/server/remote/GhidraServerAWTTest.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/Ghidra/Features/GhidraServer/src/test.slow/java/ghidra/server/remote/GhidraServerAWTTest.java b/Ghidra/Features/GhidraServer/src/test.slow/java/ghidra/server/remote/GhidraServerAWTTest.java
+--- a/Ghidra/Features/GhidraServer/src/test.slow/java/ghidra/server/remote/GhidraServerAWTTest.java	(revision 64ece4deb7b07b11d750b126160f5d1bbf494e00)
++++ b/Ghidra/Features/GhidraServer/src/test.slow/java/ghidra/server/remote/GhidraServerAWTTest.java	(date 1776518968099)
+@@ -55,7 +55,7 @@
+ 			// directly instantiate to avoid GhidraServer.main which may
+ 			// invoke System.exit
+ 			GhidraServer server = new GhidraServer(myTmpDir, GhidraServer.AuthMode.NO_AUTH_LOGIN,
+-				null, true, true, -1, true, false, null);
++				null, true, true, -1, true, false, null, false);
+ 
+ 			// exercise server elements, including a repository and buffer file
+ 			RepositoryManager mgr = (RepositoryManager) getInstanceField("mgr", server);
+Index: Ghidra/Features/GhidraServer/src/main/java/ghidra/server/security/TailscaleIdentityResolver.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/Ghidra/Features/GhidraServer/src/main/java/ghidra/server/security/TailscaleIdentityResolver.java b/Ghidra/Features/GhidraServer/src/main/java/ghidra/server/security/TailscaleIdentityResolver.java
+new file mode 100644
+--- /dev/null	(date 1776518385901)
++++ b/Ghidra/Features/GhidraServer/src/main/java/ghidra/server/security/TailscaleIdentityResolver.java	(date 1776518385901)
+@@ -0,0 +1,157 @@
++/* ###
++ * IP: GHIDRA
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package ghidra.server.security;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.net.InetAddress;
++import java.nio.charset.StandardCharsets;
++import java.util.concurrent.TimeUnit;
++
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++import com.google.gson.JsonElement;
++import com.google.gson.JsonObject;
++import com.google.gson.JsonParser;
++
++/**
++ * Resolves a client's Tailscale identity by invoking {@code tailscale whois --json <ip>}.
++ * The {@code UserProfile.LoginName} returned by Tailscale (e.g. {@code alice@github}) is
++ * reduced to a local identifier usable as a Ghidra username.
++ */
++public class TailscaleIdentityResolver {
++
++	private static final Logger log = LogManager.getLogger(TailscaleIdentityResolver.class);
++
++	private static final String TAILSCALE_COMMAND =
++		System.getProperty("ghidra.server.tailscale.cli", "tailscale");
++	private static final long CLI_TIMEOUT_SECONDS = 5;
++
++	private TailscaleIdentityResolver() {
++	}
++
++	/**
++	 * Resolves the Tailscale-derived username for the given client address, or
++	 * {@code null} if the CLI is unavailable, the address is unknown to Tailscale,
++	 * or the user has no usable login name.
++	 *
++	 * @param clientAddress the client's source address (raw, not reverse-resolved)
++	 * @return the resolved username or null
++	 */
++	public static String resolve(InetAddress clientAddress) {
++		if (clientAddress == null) {
++			return null;
++		}
++		String json = runWhois(clientAddress.getHostAddress());
++		if (json == null) {
++			return null;
++		}
++		return parseUsername(json);
++	}
++
++	private static String runWhois(String ip) {
++		Process process = null;
++		try {
++			ProcessBuilder pb =
++				new ProcessBuilder(TAILSCALE_COMMAND, "whois", "--json", ip);
++			process = pb.start();
++			// Drain stderr concurrently so the child can't block on a full pipe,
++			// and so "Warning: ..." lines don't corrupt the JSON on stdout.
++			StringBuilder stderrBuf = new StringBuilder();
++			Process p = process;
++			Thread errDrain = new Thread(() -> {
++				try (InputStream err = p.getErrorStream()) {
++					stderrBuf.append(new String(err.readAllBytes(), StandardCharsets.UTF_8));
++				}
++				catch (IOException ignored) {
++					// child already gone
++				}
++			}, "tailscale-whois-stderr");
++			errDrain.setDaemon(true);
++			errDrain.start();
++			String output;
++			try (InputStream in = process.getInputStream()) {
++				output = new String(in.readAllBytes(), StandardCharsets.UTF_8);
++			}
++			if (!process.waitFor(CLI_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
++				process.destroyForcibly();
++				log.warn("tailscale whois timed out after " + CLI_TIMEOUT_SECONDS + "s");
++				return null;
++			}
++			errDrain.join(TimeUnit.SECONDS.toMillis(1));
++			String stderr = stderrBuf.toString().trim();
++			if (process.exitValue() != 0) {
++				log.warn("tailscale whois " + ip + " exited " + process.exitValue() + ": " +
++					(stderr.isEmpty() ? output.trim() : stderr));
++				return null;
++			}
++			if (!stderr.isEmpty()) {
++				log.debug("tailscale whois stderr: " + stderr);
++			}
++			return output;
++		}
++		catch (IOException e) {
++			log.warn("Failed to invoke tailscale CLI ('" + TAILSCALE_COMMAND + "'): " +
++				e.getMessage());
++			return null;
++		}
++		catch (InterruptedException e) {
++			if (process != null) {
++				process.destroyForcibly();
++			}
++			Thread.currentThread().interrupt();
++			return null;
++		}
++	}
++
++	private static String parseUsername(String json) {
++		try {
++			JsonObject root = JsonParser.parseString(json).getAsJsonObject();
++			JsonElement profile = root.get("UserProfile");
++			if (profile == null || !profile.isJsonObject()) {
++				return null;
++			}
++			JsonElement loginName = profile.getAsJsonObject().get("LoginName");
++			if (loginName == null) {
++				return null;
++			}
++			return toGhidraUsername(loginName.getAsString());
++		}
++		catch (RuntimeException e) {
++			log.warn("Failed to parse tailscale whois JSON: " + e.getMessage());
++			return null;
++		}
++	}
++
++	/**
++	 * Reduce a Tailscale LoginName (e.g. {@code "alice@github"}, {@code "bob@example.com"})
++	 * to the local-part used as a Ghidra username. Tailscale uses {@code <handle>@github}
++	 * for GitHub OAuth users, so this yields the bare GitHub handle.
++	 */
++	static String toGhidraUsername(String loginName) {
++		if (loginName == null) {
++			return null;
++		}
++		String trimmed = loginName.trim();
++		if (trimmed.isEmpty()) {
++			return null;
++		}
++		int at = trimmed.indexOf('@');
++		String local = at > 0 ? trimmed.substring(0, at) : trimmed;
++		return local.isEmpty() ? null : local;
++	}
++}
