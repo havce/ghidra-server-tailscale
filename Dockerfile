@@ -4,7 +4,7 @@
 FROM eclipse-temurin:21-jdk-jammy AS build
 
 ARG GHIDRA_REPO=https://github.com/NationalSecurityAgency/ghidra.git
-ARG GHIDRA_REF=Ghidra_12.0.4_build
+ARG GHIDRA_REF=Ghidra_12.1.2_build
 
 ENV DEBIAN_FRONTEND=noninteractive \
     GRADLE_OPTS="-Dorg.gradle.daemon=false -Dfile.encoding=UTF-8"
