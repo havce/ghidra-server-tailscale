@@ -50,7 +50,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GHIDRA_REPOSITORIES=/var/lib/ghidra/repositories
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        bash ca-certificates curl tini \
+        bash ca-certificates curl openssl tini \
  && arch="$(dpkg --print-architecture)" \
  && case "$arch" in \
         amd64) tsarch=amd64 ;; \

@@ -7,6 +7,9 @@ services:
       - TS_STATE_DIR=/var/lib/tailscale
       - TS_SOCKET=/var/run/tailscale/tailscaled.sock
       - TS_USERSPACE=false
+      # Let the Ghidra server user (uid 1001) fetch HTTPS certificates via the
+      # shared tailscaled socket.
+      - TS_PERMIT_CERT_UID=1001
     cap_add:
       - net_admin
       - sys_module
