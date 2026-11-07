@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1
 
 # -------- Build stage: compile Ghidra from source --------
-FROM eclipse-temurin:21-jdk-jammy AS build
+FROM eclipse-temurin:25-jdk-jammy AS build
 
 ARG GHIDRA_REPO=https://github.com/NationalSecurityAgency/ghidra.git
-ARG GHIDRA_REF=Ghidra_12.1.2_build
+ARG GHIDRA_REF=Ghidra_12.2_build
 
 ENV DEBIAN_FRONTEND=noninteractive \
     GRADLE_OPTS="-Dorg.gradle.daemon=false -Dfile.encoding=UTF-8"
@@ -41,9 +41,9 @@ RUN ./gradlew buildGhidra \
  && mv /opt/ghidra_* /opt/ghidra
 
 # -------- Runtime stage --------
-FROM eclipse-temurin:21-jre-jammy
+FROM eclipse-temurin:25-jre-jammy
 
-ARG TAILSCALE_VERSION=1.78.1
+ARG TAILSCALE_VERSION=1.104.4
 
 ENV DEBIAN_FRONTEND=noninteractive \
     GHIDRA_HOME=/opt/ghidra \
